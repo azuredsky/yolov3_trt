@@ -46,7 +46,7 @@ SOFTWARE.
 
 // Forward declaration of cuda kernels
 cudaError_t cudaYoloLayerV3(const void* input, void* output, const uint& batchSize,
-                            const uint& gridSize_H, const uint& gridSize_W, const uint& numOutputClasses,
+                            const uint& gridSize, const uint& numOutputClasses,
                             const uint& numBBoxes, uint64_t outputSize, cudaStream_t stream);
 
 class PluginFactory : public nvinfer1::IPluginFactory
@@ -60,7 +60,7 @@ public:
     void destroy();
 
 private:
-    static const int m_MaxLeakyLayers = 172;
+    static const int m_MaxLeakyLayers = 72;
     static const int m_ReorgStride = 2;
     static constexpr float m_LeakyNegSlope = 0.1;
     static const int m_NumBoxes = 5;
@@ -105,7 +105,7 @@ class YoloLayerV3 : public nvinfer1::IPlugin
 {
 public:
     YoloLayerV3(const void* data, size_t length);
-    YoloLayerV3(const uint& numBoxes, const uint& numClasses, const uint& gridSize_H, const uint& gridSize_W);
+    YoloLayerV3(const uint& numBoxes, const uint& numClasses, const uint& gridSize);
     int getNbOutputs() const override;
     nvinfer1::Dims getOutputDimensions(int index, const nvinfer1::Dims* inputs,
                                        int nbInputDims) override;
@@ -135,8 +135,7 @@ private:
     }
     uint m_NumBoxes;
     uint m_NumClasses;
-    uint m_GridSize_H;
-    uint m_GridSize_W;
+    uint m_GridSize;
     uint64_t m_OutputSize;
 };
 

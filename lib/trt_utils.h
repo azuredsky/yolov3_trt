@@ -30,16 +30,18 @@ SOFTWARE.
 /* OpenCV headers */
 #include <opencv/cv.h>
 #include <opencv2/core/core.hpp>
+#include <opencv2/dnn/dnn.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 
 #include <set>
-#include <map>
 
 #include "NvInfer.h"
 
+#include "ds_image.h"
 #include "plugin_factory.h"
 
+class DsImage;
 struct BBox
 {
     float x1, y1, x2, y2;
@@ -49,6 +51,7 @@ struct BBoxInfo
 {
     BBox box;
     int label;
+    int classId; // For coco benchmarking
     float prob;
 };
 
@@ -82,26 +85,23 @@ private:
                              nvinfer1::DimsHW stride, nvinfer1::DimsHW padding,
                              nvinfer1::DimsHW dilation, const char* layerName) const override
     {
-        //assert(inputDims.d[0] == inputDims.d[1]);
+        assert(inputDims.d[0] == inputDims.d[1]);
         assert(kernelSize.d[0] == kernelSize.d[1]);
         assert(stride.d[0] == stride.d[1]);
         assert(padding.d[0] == padding.d[1]);
 
-        int outputDim_H, outputDim_W;
+        int outputDim;
         // Only layer maxpool_12 makes use of same padding
         if (m_SamePaddingLayers.find(layerName) != m_SamePaddingLayers.end())
         {
-            //outputDim = (inputDims.d[0] + 2 * padding.d[0]) / stride.d[0];
-            outputDim_H = (inputDims.d[0] + 2 * padding.d[0] - kernelSize.d[0]) / stride.d[0] + 1;
-            outputDim_W = (inputDims.d[1] + 2 * padding.d[1] - kernelSize.d[1]) / stride.d[1] + 1;
+            outputDim = (inputDims.d[0] + 2 * padding.d[0]) / stride.d[0];
         }
         // Valid Padding
         else
         {
-            outputDim_H = (inputDims.d[0] - kernelSize.d[0]) / stride.d[0] + 1;
-            outputDim_W = (inputDims.d[1] - kernelSize.d[1]) / stride.d[1] + 1;
+            outputDim = (inputDims.d[0] - kernelSize.d[0]) / stride.d[0] + 1;
         }
-        return nvinfer1::DimsHW{outputDim_H, outputDim_W};
+        return nvinfer1::DimsHW{outputDim, outputDim};
     }
 
 public:
@@ -109,7 +109,8 @@ public:
 };
 
 // Common helper functions
-
+cv::Mat blobFromDsImages(const std::vector<DsImage>& inputImages, const int& inputH,
+                         const int& inputW);
 std::string trim(std::string s);
 float clamp(const float val, const float minVal, const float maxVal);
 bool fileExists(const std::string fileName, bool verbose = true);
@@ -117,13 +118,15 @@ BBox convertBBoxNetRes(const float& bx, const float& by, const float& bw, const 
                        const uint& stride, const uint& netW, const uint& netH);
 void convertBBoxImgRes(const float scalingFactor, const float& xOffset, const float& yOffset,
                        BBox& bbox);
-void printPredictions(const BBoxInfo& info);
+void printPredictions(const BBoxInfo& info, const std::string& className);
+std::vector<std::string> loadListFromTextFile(const std::string filename);
+std::vector<std::string> loadImageList(const std::string filename, const std::string prefix);
 std::vector<BBoxInfo> nmsAllClasses(const float nmsThresh, std::vector<BBoxInfo>& binfo,
                                     const uint numClasses);
 std::vector<BBoxInfo> nonMaximumSuppression(const float nmsThresh, std::vector<BBoxInfo> binfo);
 nvinfer1::ICudaEngine* loadTRTEngine(const std::string planFilePath, PluginFactory* pluginFactory,
                                      Logger& logger);
-std::vector<float> loadWeights(const std::string weightsFilePath);
+std::vector<float> loadWeights(const std::string weightsFilePath, const std::string& networkType);
 std::string dimsToString(const nvinfer1::Dims d);
 void displayDimType(const nvinfer1::Dims d);
 int getNumChannels(nvinfer1::ITensor* t);

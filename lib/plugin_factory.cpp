@@ -109,23 +109,20 @@ YoloLayerV3::YoloLayerV3(const void* data, size_t length)
     const char *d = static_cast<const char*>(data), *a = d;
     read(d, m_NumBoxes);
     read(d, m_NumClasses);
-    read(d, m_GridSize_H);
-    read(d, m_GridSize_W);
+    read(d, m_GridSize);
     read(d, m_OutputSize);
     assert(d = a + length);
 };
 
-YoloLayerV3::YoloLayerV3(const uint& numBoxes, const uint& numClasses, const uint& gridSize_H, const uint& gridSize_W) :
+YoloLayerV3::YoloLayerV3(const uint& numBoxes, const uint& numClasses, const uint& gridSize) :
     m_NumBoxes(numBoxes),
     m_NumClasses(numClasses),
-    m_GridSize_H(gridSize_H),
-    m_GridSize_W(gridSize_W)
+    m_GridSize(gridSize)
 {
     assert(m_NumBoxes > 0);
     assert(m_NumClasses > 0);
-    assert(m_GridSize_H > 0);
-    assert(m_GridSize_W > 0);
-    m_OutputSize = m_GridSize_H * m_GridSize_W * (m_NumBoxes * (4 + 1 + m_NumClasses));
+    assert(m_GridSize > 0);
+    m_OutputSize = m_GridSize * m_GridSize * (m_NumBoxes * (4 + 1 + m_NumClasses));
 };
 
 int YoloLayerV3::getNbOutputs() const { return 1; }
@@ -154,14 +151,14 @@ size_t YoloLayerV3::getWorkspaceSize(int maxBatchSize) const { return 0; }
 int YoloLayerV3::enqueue(int batchSize, const void* const* inputs, void** outputs, void* workspace,
                          cudaStream_t stream)
 {
-    NV_CUDA_CHECK(cudaYoloLayerV3(inputs[0], outputs[0], batchSize, m_GridSize_H, m_GridSize_W, m_NumClasses,
+    NV_CUDA_CHECK(cudaYoloLayerV3(inputs[0], outputs[0], batchSize, m_GridSize, m_NumClasses,
                                   m_NumBoxes, m_OutputSize, stream));
     return 0;
 }
 
 size_t YoloLayerV3::getSerializationSize()
 {
-    return sizeof(m_NumBoxes) + sizeof(m_NumClasses) + sizeof(m_GridSize_H) + sizeof(m_GridSize_W) + sizeof(m_OutputSize);
+    return sizeof(m_NumBoxes) + sizeof(m_NumClasses) + sizeof(m_GridSize) + sizeof(m_OutputSize);
 }
 
 void YoloLayerV3::serialize(void* buffer)
@@ -169,8 +166,7 @@ void YoloLayerV3::serialize(void* buffer)
     char *d = static_cast<char*>(buffer), *a = d;
     write(d, m_NumBoxes);
     write(d, m_NumClasses);
-    write(d, m_GridSize_H);
-    write(d, m_GridSize_W);
+    write(d, m_GridSize);
     write(d, m_OutputSize);
     assert(d == a + getSerializationSize());
 }

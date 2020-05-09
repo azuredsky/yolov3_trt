@@ -24,25 +24,31 @@ SOFTWARE.
 */
 
 #include "yolo.h"
+
 #include <fstream>
 
-Yolo::Yolo(std::string configFilePath, std::string wtsFilePath, std::string precision, std::string enginePath,
-        uint class_num, float probThresh) :
-    m_ConfigFilePath(configFilePath),
-    m_WtsFilePath(wtsFilePath),
-    m_Precision(precision),
-    m_EnginePath(enginePath),
-    m_ClassNum(class_num),
-    m_ProbThresh(probThresh),
-    m_DeviceType("kGPU"),
-    m_InputBlobName("data"),
+Yolo::Yolo(const uint batchSize, const NetworkInfo& networkInfo, const InferParams& inferParams) :
+    m_EnginePath(networkInfo.enginePath),
+    m_NetworkType(networkInfo.networkType),
+    m_ConfigFilePath(networkInfo.configFilePath),
+    m_WtsFilePath(networkInfo.wtsFilePath),
+    m_LabelsFilePath(networkInfo.labelsFilePath),
+    m_Precision(networkInfo.precision),
+    m_DeviceType(networkInfo.deviceType),
+    m_CalibImages(inferParams.calibImages),
+    m_CalibImagesFilePath(inferParams.calibImagesPath),
+    m_CalibTableFilePath(networkInfo.calibrationTablePath),
+    m_InputBlobName(networkInfo.inputBlobName),
     m_InputH(0),
     m_InputW(0),
     m_InputC(0),
     m_InputSize(0),
-    m_NMSThresh(0.45),
+    m_ProbThresh(inferParams.probThresh),
+    m_NMSThresh(inferParams.nmsThresh),
+    m_PrintPerfInfo(inferParams.printPerfInfo),
+    m_PrintPredictions(inferParams.printPredictionInfo),
     m_Logger(Logger()),
-    m_BatchSize(1),
+    m_BatchSize(batchSize),
     m_Network(nullptr),
     m_Builder(nullptr),
     m_ModelStream(nullptr),
@@ -53,6 +59,7 @@ Yolo::Yolo(std::string configFilePath, std::string wtsFilePath, std::string prec
     m_PluginFactory(new PluginFactory),
     m_TinyMaxpoolPaddingFormula(new YoloTinyMaxpoolPaddingFormula)
 {
+    m_ClassNames = loadListFromTextFile(m_LabelsFilePath);
     m_configBlocks = parseConfigFile(m_ConfigFilePath);
     parseConfigBlocks();
 
@@ -60,9 +67,16 @@ Yolo::Yolo(std::string configFilePath, std::string wtsFilePath, std::string prec
     {
         createYOLOEngine();
     }
+    else if (m_Precision == "kINT8")
+    {
+        Int8EntropyCalibrator calibrator(m_BatchSize, m_CalibImages, m_CalibImagesFilePath,
+                                         m_CalibTableFilePath, m_InputSize, m_InputH, m_InputW,
+                                         m_InputBlobName);
+        createYOLOEngine(nvinfer1::DataType::kINT8, &calibrator);
+    }
     else if (m_Precision == "kHALF")
     {
-        createYOLOEngine(nvinfer1::DataType::kHALF);
+        createYOLOEngine(nvinfer1::DataType::kHALF, nullptr);
     }
     else
     {
@@ -108,9 +122,9 @@ Yolo::~Yolo()
     m_TinyMaxpoolPaddingFormula.reset();
 }
 
-void Yolo::createYOLOEngine(const nvinfer1::DataType dataType)
+void Yolo::createYOLOEngine(const nvinfer1::DataType dataType, Int8EntropyCalibrator* calibrator)
 {
-    std::vector<float> weights = loadWeights(m_WtsFilePath);
+    std::vector<float> weights = loadWeights(m_WtsFilePath, m_NetworkType);
     std::vector<nvinfer1::Weights> trtWeights;
     int weightPtr = 0;
     int channels = m_InputC;
@@ -188,7 +202,6 @@ void Yolo::createYOLOEngine(const nvinfer1::DataType dataType)
             assert(previous != nullptr);
             channels = getNumChannels(previous);
             std::string outputVol = dimsToString(previous->getDimensions());
-
             tensorOutputs.push_back(out->getOutput(0));
             printLayerInfo(layerIndex, layerType, inputVol, outputVol, std::to_string(weightPtr));
         }
@@ -218,22 +231,19 @@ void Yolo::createYOLOEngine(const nvinfer1::DataType dataType)
         else if (m_configBlocks.at(i).at("type") == "yolo")
         {
             nvinfer1::Dims prevTensorDims = previous->getDimensions();
-            //assert(prevTensorDims.d[1] == prevTensorDims.d[2]);
+            assert(prevTensorDims.d[1] == prevTensorDims.d[2]);
             TensorInfo& curYoloTensor = m_OutputTensors.at(outputTensorCount);
-            curYoloTensor.gridSize_H = prevTensorDims.d[1];
-            curYoloTensor.gridSize_W = prevTensorDims.d[2];
-            curYoloTensor.stride = m_InputH / curYoloTensor.gridSize_H;
-            m_OutputTensors.at(outputTensorCount).volume = curYoloTensor.gridSize_H
-                * curYoloTensor.gridSize_W
+            curYoloTensor.gridSize = prevTensorDims.d[1];
+            curYoloTensor.stride = m_InputW / curYoloTensor.gridSize;
+            m_OutputTensors.at(outputTensorCount).volume = curYoloTensor.gridSize
+                * curYoloTensor.gridSize
                 * (curYoloTensor.numBBoxes * (5 + curYoloTensor.numClasses));
-
             std::string layerName = "yolo_" + std::to_string(i);
             curYoloTensor.blobName = layerName;
             nvinfer1::IPlugin* yoloPlugin
                 = new YoloLayerV3(m_OutputTensors.at(outputTensorCount).numBBoxes,
                                   m_OutputTensors.at(outputTensorCount).numClasses,
-                                  m_OutputTensors.at(outputTensorCount).gridSize_H,
-                                  m_OutputTensors.at(outputTensorCount).gridSize_W);
+                                  m_OutputTensors.at(outputTensorCount).gridSize);
             assert(yoloPlugin != nullptr);
             nvinfer1::IPluginLayer* yolo = m_Network->addPlugin(&previous, 1, *yoloPlugin);
             assert(yolo != nullptr);
@@ -254,11 +264,10 @@ void Yolo::createYOLOEngine(const nvinfer1::DataType dataType)
             nvinfer1::Dims prevTensorDims = previous->getDimensions();
             assert(prevTensorDims.d[1] == prevTensorDims.d[2]);
             TensorInfo& curRegionTensor = m_OutputTensors.at(outputTensorCount);
-            curRegionTensor.gridSize_H = prevTensorDims.d[1];
-            curRegionTensor.gridSize_W = prevTensorDims.d[2];
-            curRegionTensor.stride = m_InputW / curRegionTensor.gridSize_W;
-            m_OutputTensors.at(outputTensorCount).volume = curRegionTensor.gridSize_H
-                * curRegionTensor.gridSize_W
+            curRegionTensor.gridSize = prevTensorDims.d[1];
+            curRegionTensor.stride = m_InputW / curRegionTensor.gridSize;
+            m_OutputTensors.at(outputTensorCount).volume = curRegionTensor.gridSize
+                * curRegionTensor.gridSize
                 * (curRegionTensor.numBBoxes * (5 + curRegionTensor.numClasses));
             std::string layerName = "region_" + std::to_string(i);
             curRegionTensor.blobName = layerName;
@@ -308,25 +317,24 @@ void Yolo::createYOLOEngine(const nvinfer1::DataType dataType)
             size_t found = m_configBlocks.at(i).at("layers").find(",");
             if (found != std::string::npos)
             {
-                //add by zxj on 2019.8.5
-                std::string str = trim(m_configBlocks.at(i).at("layers"));   //  "-1,-3,-5,-6"
-                std::vector<int> indexs;
-                char* tmp = strtok(const_cast<char*>(str.c_str()), ",");
-                while(tmp){
-                    int index = std::stoi(tmp);
-                    if (index < 0)
-                        index = tensorOutputs.size() + index;
-                    assert(index < static_cast<int>(tensorOutputs.size()) && index >= 0);
-                    indexs.emplace_back(index);
-                    tmp = strtok(NULL, ",");
+                int idx1 = std::stoi(trim(m_configBlocks.at(i).at("layers").substr(0, found)));
+                int idx2 = std::stoi(trim(m_configBlocks.at(i).at("layers").substr(found + 1)));
+                if (idx1 < 0)
+                {
+                    idx1 = tensorOutputs.size() + idx1;
                 }
-                int N = indexs.size();
+                if (idx2 < 0)
+                {
+                    idx2 = tensorOutputs.size() + idx2;
+                }
+                assert(idx1 < static_cast<int>(tensorOutputs.size()) && idx1 >= 0);
+                assert(idx2 < static_cast<int>(tensorOutputs.size()) && idx2 >= 0);
                 nvinfer1::ITensor** concatInputs
-                        = reinterpret_cast<nvinfer1::ITensor**>(malloc(sizeof(nvinfer1::ITensor*) * N));
-                for(auto kk = 0; kk < N; ++kk)
-                    concatInputs[kk] = tensorOutputs[indexs[kk]];
+                    = reinterpret_cast<nvinfer1::ITensor**>(malloc(sizeof(nvinfer1::ITensor*) * 2));
+                concatInputs[0] = tensorOutputs[idx1];
+                concatInputs[1] = tensorOutputs[idx2];
                 nvinfer1::IConcatenationLayer* concat
-                        = m_Network->addConcatenation(concatInputs, N);
+                    = m_Network->addConcatenation(concatInputs, 2);
                 assert(concat != nullptr);
                 std::string concatLayerName = "route_" + std::to_string(i - 1);
                 concat->setName(concatLayerName.c_str());
@@ -336,15 +344,11 @@ void Yolo::createYOLOEngine(const nvinfer1::DataType dataType)
                 assert(previous != nullptr);
                 std::string outputVol = dimsToString(previous->getDimensions());
                 // set the output volume depth
-
-                channels = 0;
-                for(auto kk = 0; kk < N; ++kk)
-                    channels += getNumChannels(tensorOutputs[indexs[kk]]);
-
+                channels
+                    = getNumChannels(tensorOutputs[idx1]) + getNumChannels(tensorOutputs[idx2]);
                 tensorOutputs.push_back(concat->getOutput(0));
                 printLayerInfo(layerIndex, "route", "        -", outputVol,
                                std::to_string(weightPtr));
-                // END
             }
             else
             {
@@ -366,11 +370,9 @@ void Yolo::createYOLOEngine(const nvinfer1::DataType dataType)
         }
         else if (m_configBlocks.at(i).at("type") == "upsample")
         {
-            std::string inputVol = dimsToString(previous->getDimensions());   // 256 * 13 * 19
-
+            std::string inputVol = dimsToString(previous->getDimensions());
             nvinfer1::ILayer* out = netAddUpsample(i - 1, m_configBlocks[i], weights, trtWeights,
                                                    channels, previous, m_Network);
-
             previous = out->getOutput(0);
             std::string outputVol = dimsToString(previous->getDimensions());
             tensorOutputs.push_back(out->getOutput(0));
@@ -379,15 +381,12 @@ void Yolo::createYOLOEngine(const nvinfer1::DataType dataType)
         else if (m_configBlocks.at(i).at("type") == "maxpool")
         {
             // Add same padding layers
-//            if (m_configBlocks.at(i).at("size") == "2" && m_configBlocks.at(i).at("stride") == "1")
-//            {
-//                m_TinyMaxpoolPaddingFormula->addSamePaddingLayer("maxpool_" + std::to_string(i));
-//            }
-            m_TinyMaxpoolPaddingFormula->addSamePaddingLayer("maxpool_" + std::to_string(i));
-
+            if (m_configBlocks.at(i).at("size") == "2" && m_configBlocks.at(i).at("stride") == "1")
+            {
+                m_TinyMaxpoolPaddingFormula->addSamePaddingLayer("maxpool_" + std::to_string(i));
+            }
             std::string inputVol = dimsToString(previous->getDimensions());
             nvinfer1::ILayer* out = netAddMaxpool(i, m_configBlocks.at(i), previous, m_Network);
-
             previous = out->getOutput(0);
             assert(previous != nullptr);
             std::string outputVol = dimsToString(previous->getDimensions());
@@ -420,10 +419,19 @@ void Yolo::createYOLOEngine(const nvinfer1::DataType dataType)
         return;
     }
 
+    std::cout << "Unable to find cached TensorRT engine for network : " << m_NetworkType
+              << " precision : " << m_Precision << " and batch size :" << m_BatchSize << std::endl;
+
     m_Builder->setMaxBatchSize(m_BatchSize);
     m_Builder->setMaxWorkspaceSize(1 << 20);
 
-    if (dataType == nvinfer1::DataType::kHALF)
+    if (dataType == nvinfer1::DataType::kINT8)
+    {
+        assert((calibrator != nullptr) && "Invalid calibrator for INT8 precision");
+        m_Builder->setInt8Mode(true);
+        m_Builder->setInt8Calibrator(calibrator);
+    }
+    else if (dataType == nvinfer1::DataType::kHALF)
     {
         m_Builder->setHalf2Mode(true);
     }
@@ -539,7 +547,7 @@ void Yolo::parseConfigBlocks()
             m_InputH = std::stoul(block.at("height"));
             m_InputW = std::stoul(block.at("width"));
             m_InputC = std::stoul(block.at("channels"));
-            //assert(m_InputW == m_InputH);
+            assert(m_InputW == m_InputH);
             m_InputSize = m_InputC * m_InputH * m_InputW;
         }
         else if ((block.at("type") == "region") || (block.at("type") == "yolo"))
@@ -572,7 +580,7 @@ void Yolo::parseConfigBlocks()
                 }
             }
 
-            if (1)
+            if ((m_NetworkType == "yolov3") || (m_NetworkType == "yolov3-tiny"))
             {
                 assert((block.find("mask") != block.end())
                        && std::string("Missing 'mask' param in " + block.at("type") + " layer")
@@ -633,7 +641,6 @@ bool Yolo::verifyYoloEngine()
     {
         assert(!strcmp(m_Engine->getBindingName(tensor.bindingIndex), tensor.blobName.c_str())
                && "Blobs names dont match between cfg and engine file \n");
-
         assert(get3DTensorVolume(m_Engine->getBindingDimensions(tensor.bindingIndex))
                    == tensor.volume
                && "Tensor volumes dont match between cfg and engine file \n");
@@ -678,67 +685,4 @@ void Yolo::writePlanFileToDisk()
     outFile.close();
 
     std::cout << "Serialized plan file cached at location : " << m_EnginePath << std::endl;
-}
-
-std::vector<BBoxInfo> Yolo::decodeTensor(const int imageIdx, const int imageH, const int imageW,
-                                           const TensorInfo& tensor)
-{
-    float scalingFactor
-            = std::min(static_cast<float>(m_InputW) / imageW, static_cast<float>(m_InputH) / imageH);
-    float xOffset = (m_InputW - scalingFactor * imageW) / 2;
-    float yOffset = (m_InputH - scalingFactor * imageH) / 2;
-
-    const float* detections = &tensor.hostBuffer[imageIdx * tensor.volume];
-
-    std::vector<BBoxInfo> binfo;
-    for (uint y = 0; y < tensor.gridSize_H; ++y)
-    {
-        for (uint x = 0; x < tensor.gridSize_W; ++x)
-        {
-            for (uint b = 0; b < tensor.numBBoxes; ++b)
-            {
-                const float pw = tensor.anchors[tensor.masks[b] * 2];
-                const float ph = tensor.anchors[tensor.masks[b] * 2 + 1];
-
-                const int numGridCells = tensor.gridSize_H * tensor.gridSize_W;
-                const int bbindex = y * tensor.gridSize_W + x;
-                const float bx
-                        = x + detections[bbindex + numGridCells * (b * (5 + tensor.numClasses) + 0)];
-
-                const float by
-                        = y + detections[bbindex + numGridCells * (b * (5 + tensor.numClasses) + 1)];
-                const float bw
-                        = pw * detections[bbindex + numGridCells * (b * (5 + tensor.numClasses) + 2)];
-                const float bh
-                        = ph * detections[bbindex + numGridCells * (b * (5 + tensor.numClasses) + 3)];
-
-                const float objectness
-                        = detections[bbindex + numGridCells * (b * (5 + tensor.numClasses) + 4)];
-
-                float maxProb = 0.0f;
-                int maxIndex = -1;
-
-                for (uint i = 0; i < tensor.numClasses; ++i)
-                {
-                    float prob
-                            = (detections[bbindex
-                                          + numGridCells * (b * (5 + tensor.numClasses) + (5 + i))]);
-
-                    if (prob > maxProb)
-                    {
-                        maxProb = prob;
-                        maxIndex = i;
-                    }
-                }
-                maxProb = objectness * maxProb;
-
-                if (maxProb > m_ProbThresh)
-                {
-                    addBBoxProposal(bx, by, bw, bh, tensor.stride, scalingFactor, xOffset, yOffset,
-                                    maxIndex, maxProb, binfo);
-                }
-            }
-        }
-    }
-    return binfo;
 }

@@ -1,80 +1,125 @@
-#include "trt_utils.h"
-#include "yolo.h"
-#include "image.h"
-#include "GetFiles.hpp"
+/**
+MIT License
 
-#include <experimental/filesystem>
+Copyright (c) 2018 NVIDIA CORPORATION. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*
+*/
+#include "ds_image.h"
+#include "trt_utils.h"
+#include "yolov3.h"
+#include "yolo_config_parser.h"
+
 #include <fstream>
 #include <string>
-#include <ctime>
+#include <sys/time.h>
+
+
 using namespace std;
 using namespace cv;
 
-bool decode = true;
-
-std::string configFilePath = "../data/yolov3.cfg";
-std::string wtsFilePath = "../data/yolov3.weights";
-std::string precision = "kFLOAT";
-std::string enginePath = "../data/yolov3-" + precision + "-kGPU-batch1" + ".engine";
-uint class_num = 80;
-float probThresh = 0.2;
-
-
 int main(int argc, char** argv)
 {
+    NetworkInfo yoloInfo = getYoloNetworkInfo();
+    InferParams yoloInferParams = getYoloInferParams();
+    uint64_t seed = getSeed();
+    std::string networkType = getNetworkType();
+    std::string precision = getPrecision();
+    bool decode = getDecode();
 
-    std::unique_ptr<Yolo> inferNet(new Yolo(configFilePath, wtsFilePath, precision, enginePath, class_num, probThresh));
+    uint batchSize = getBatchSize();
 
-    std::vector<std::string> imageList;
-    getFilesName("../imgs", imageList);
 
-    std::cout << "Total number of images used for inference : " << imageList.size() << std::endl;
+    srand(unsigned(seed));
 
-    double t = cv::getTickCount();
+    std::unique_ptr<Yolo> inferNet{nullptr};
 
-    // Batched inference loop
-    for (uint loopIdx = 0; loopIdx < imageList.size(); ++loopIdx)
+    inferNet = std::unique_ptr<Yolo>{new YoloV3(batchSize, yoloInfo, yoloInferParams)};
+
+
+    Mat frame;
+    VideoCapture cap;
+    string videofile;
+    if(argc>1)
     {
-        Mat img = imread(imageList[loopIdx]);
-
-        image im = cv_img_to_image(img);
-        image sized = letterbox_image(im, inferNet->getInputW(), inferNet->getInputH());   //调整尺寸
-        uchar *data = reinterpret_cast<uchar *>(sized.data);
-
-        double t1 = cv::getTickCount();
-        inferNet->doInference(data);
-        cout<<(cv::getTickCount() - t1) * 1000.0 / cv::getTickFrequency()<< " ms\n";
-
-        if (decode) {
-            std::vector<BBoxInfo> binfo = inferNet->decodeDetections(0, im.h, im.w);
-            std::vector<BBoxInfo> remaining = nmsAllClasses(inferNet->getNMSThresh(), binfo, inferNet->getClassNum());
-            for (auto b : remaining) {
-                printPredictions(b);
-
-                int H = img.rows;
-                int W = img.cols;
-                float x1 = b.box.x1;
-                float y1 = b.box.y1;
-                float x2 = b.box.x2;
-                float y2 = b.box.y2;
-
-                if(x1 < 0) x1 = 0.0;
-                if(y1 < 0) y1 = 0.0;
-                if(x2 >= W) x2 = W - 1.0;
-                if(y2 >= H) y2 = H - 1.0;
-
-                cv::rectangle(img, Point(x1, y1), Point(x2, y2), Scalar(0, 0, 255), 2);
-
-            }
-            imshow("", img);
-            waitKey();
+        videofile = argv[1];
+        if(argc>2)
+        {
         }
     }
-    cout<<"It takes "<<(cv::getTickCount() - t) * 1000.0 / cv::getTickFrequency() / imageList.size() << " ms per inference\n";
+    else
+    {
+        videofile = "/work/workspace/track_video/video/3.mp4";
+    }
+    cap.open(videofile);
+       if (!cap.isOpened())
+           return -1;
 
-    std::cout << std::endl
-              << "Network Type : YoloV3\n" << "Precision : " << precision
-              << std::endl;
+    std::vector<DsImage> dsImages;
+    const int barWidth = 70;
+    double inferElapsed = 0;
+
+    std::ofstream fout;
+    bool written = false;
+
+    // Batched inference loop
+    for (uint loopIdx = 0; ; loopIdx += batchSize)
+    {
+        cap >> frame;
+        // Load a new batch
+        dsImages.clear();
+
+        dsImages.emplace_back(frame.data, frame.rows, frame.cols, inferNet->getInputH(), inferNet->getInputW());
+
+
+        cv::Mat trtInput = blobFromDsImages(dsImages, inferNet->getInputH(), inferNet->getInputW());
+        struct timeval inferStart, inferEnd;
+        gettimeofday(&inferStart, NULL);
+        inferNet->doInference(trtInput.data, dsImages.size());
+        gettimeofday(&inferEnd, NULL);
+        inferElapsed += ((inferEnd.tv_sec - inferStart.tv_sec)
+                         + (inferEnd.tv_usec - inferStart.tv_usec) / 1000000.0)
+            * 1000;
+
+        if (decode)
+        {
+            for (uint imageIdx = 0; imageIdx < dsImages.size(); ++imageIdx)
+            {
+                auto curImage = dsImages.at(imageIdx);
+                auto binfo = inferNet->decodeDetections(imageIdx, curImage.getImageHeight(),
+                                                        curImage.getImageWidth());
+                auto remaining
+                    = nmsAllClasses(inferNet->getNMSThresh(), binfo, inferNet->getNumClasses());
+                for (auto b : remaining)
+                {
+                    if (inferNet->isPrintPredictions())
+                    {
+                        printPredictions(b, inferNet->getClassName(b.label));
+                    }
+                    curImage.addBBox(b, inferNet->getClassName(b.label));
+                }
+                curImage.showImage();
+            }
+        }
+    }
+
 
     return 0;
 }

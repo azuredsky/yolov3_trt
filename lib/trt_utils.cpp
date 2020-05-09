@@ -29,6 +29,17 @@ SOFTWARE.
 #include <fstream>
 #include <iomanip>
 
+cv::Mat blobFromDsImages(const std::vector<DsImage>& inputImages, const int& inputH,
+                         const int& inputW)
+{
+    std::vector<cv::Mat> letterboxStack(inputImages.size());
+    for (uint i = 0; i < inputImages.size(); ++i)
+    {
+        inputImages.at(i).getLetterBoxedImage().copyTo(letterboxStack.at(i));
+    }
+    return cv::dnn::blobFromImages(letterboxStack, 1.0, cv::Size(inputW, inputH),
+                                   cv::Scalar(0.0, 0.0, 0.0), false, false);
+}
 
 static void leftTrim(std::string& s)
 {
@@ -101,11 +112,56 @@ void convertBBoxImgRes(const float scalingFactor, const float& xOffset, const fl
     bbox.y2 /= scalingFactor;
 }
 
-void printPredictions(const BBoxInfo& b)
+void printPredictions(const BBoxInfo& b, const std::string& className)
 {
-    std::cout << " label:" << b.label
+    std::cout << " label:" << b.label << "(" << className << ")"
               << " confidence:" << b.prob << " xmin:" << b.box.x1 << " ymin:" << b.box.y1
               << " xmax:" << b.box.x2 << " ymax:" << b.box.y2 << std::endl;
+}
+
+std::vector<std::string> loadListFromTextFile(const std::string filename)
+{
+    assert(fileExists(filename));
+    std::vector<std::string> list;
+
+    std::ifstream f(filename);
+    if (!f)
+    {
+        std::cout << "failed to open " << filename;
+        assert(0);
+    }
+
+    std::string line;
+    while (std::getline(f, line))
+    {
+        if (line.empty())
+            continue;
+
+        else
+            list.push_back(trim(line));
+    }
+
+    return list;
+}
+
+std::vector<std::string> loadImageList(const std::string filename, const std::string prefix)
+{
+    std::vector<std::string> fileList = loadListFromTextFile(filename);
+    for (auto& file : fileList)
+    {
+        if (fileExists(file, false))
+            continue;
+        else
+        {
+            std::string prefixed = prefix + file;
+            if (fileExists(prefixed, false))
+                file = prefixed;
+            else
+                std::cerr << "WARNING: couldn't find: " << prefixed
+                          << " while loading: " << filename << std::endl;
+        }
+    }
+    return fileList;
 }
 
 std::vector<BBoxInfo> nmsAllClasses(const float nmsThresh, std::vector<BBoxInfo>& binfo,
@@ -198,7 +254,7 @@ nvinfer1::ICudaEngine* loadTRTEngine(const std::string planFilePath, PluginFacto
     return engine;
 }
 
-std::vector<float> loadWeights(const std::string weightsFilePath)
+std::vector<float> loadWeights(const std::string weightsFilePath, const std::string& networkType)
 {
     assert(fileExists(weightsFilePath));
     std::cout << "Loading pre-trained weights..." << std::endl;
@@ -206,9 +262,22 @@ std::vector<float> loadWeights(const std::string weightsFilePath)
     assert(file.good());
     std::string line;
 
-
-    file.ignore(4 * 5);
-
+    if (networkType == "yolov2")
+    {
+        // Remove 4 int32 bytes of data from the stream belonging to the header
+        file.ignore(4 * 4);
+    }
+    else if ((networkType == "yolov3") || (networkType == "yolov3-tiny")
+             || (networkType == "yolov2-tiny"))
+    {
+        // Remove 5 int32 bytes of data from the stream belonging to the header
+        file.ignore(4 * 5);
+    }
+    else
+    {
+        std::cout << "Invalid network type" << std::endl;
+        assert(0);
+    }
 
     std::vector<float> weights;
     char* floatWeight = new char[4];
@@ -230,7 +299,6 @@ std::string dimsToString(const nvinfer1::Dims d)
 {
     std::stringstream s;
     assert(d.nbDims >= 1);
-
     for (int i = 0; i < d.nbDims - 1; ++i)
     {
         s << std::setw(4) << d.d[i] << " x";
@@ -267,7 +335,6 @@ int getNumChannels(nvinfer1::ITensor* t)
 uint64_t get3DTensorVolume(nvinfer1::Dims inputDims)
 {
     assert(inputDims.nbDims == 3);
-    //printf("zxj %d %d %d\n", inputDims.d[0], inputDims.d[1], inputDims.d[2]);
     return inputDims.d[0] * inputDims.d[1] * inputDims.d[2];
 }
 
@@ -287,16 +354,6 @@ nvinfer1::ILayer* netAddMaxpool(int layerIdx, std::map<std::string, std::string>
     std::string maxpoolLayerName = "maxpool_" + std::to_string(layerIdx);
     pool->setStride(nvinfer1::DimsHW{stride, stride});
     pool->setName(maxpoolLayerName.c_str());
-
-    // add by zxj on 2019-8-5
-    int pad = 0;
-    if((size - stride) % 2 == 0)
-        pad = (size - 1) / 2;
-    else
-        pad = (size + 1) / 2;
-
-    pool->setPadding(nvinfer1::DimsHW{pad, pad});
-    // end
 
     return pool;
 }
@@ -496,108 +553,6 @@ nvinfer1::ILayer* netAddConvBNLeaky(int layerIdx, std::map<std::string, std::str
     return leaky;
 }
 
-//nvinfer1::ILayer* netAddUpsample(int layerIdx, std::map<std::string, std::string>& block,
-//                                 std::vector<float>& weights,
-//                                 std::vector<nvinfer1::Weights>& trtWeights, int& inputChannels,
-//                                 nvinfer1::ITensor* input, nvinfer1::INetworkDefinition* network)
-//{
-//    assert(block.at("type") == "upsample");
-//    nvinfer1::Dims inpDims = input->getDimensions();
-//    assert(inpDims.nbDims == 3);
-//    //assert(inpDims.d[1] == inpDims.d[2]);
-//    int h = inpDims.d[1];
-//    int w = inpDims.d[2];
-//    int stride = std::stoi(block.at("stride"));
-//    // add pre multiply matrix as a constant
-//    nvinfer1::Dims preDims{3,
-//                           {1, stride * h, w},
-//                           {nvinfer1::DimensionType::kCHANNEL, nvinfer1::DimensionType::kSPATIAL,
-//                            nvinfer1::DimensionType::kSPATIAL}};
-//    int size = stride * h * w;
-//    nvinfer1::Weights preMul{nvinfer1::DataType::kFLOAT, nullptr, size};
-//    float* preWt = new float[size];
-//    /* (2*h * w)
-//    [ [1, 0, ..., 0],
-//      [1, 0, ..., 0],
-//      [0, 1, ..., 0],
-//      [0, 1, ..., 0],
-//      ...,
-//      ...,
-//      [0, 0, ..., 1],
-//      [0, 0, ..., 1] ]
-//    */
-//    for (int i = 0, idx = 0; i < h; ++i)
-//    {
-//        for (int s = 0; s < stride; ++s)
-//        {
-//            for (int j = 0; j < w; ++j, ++idx)
-//            {
-//                preWt[idx] = (i == j) ? 1.0 : 0.0;
-//            }
-//        }
-//    }
-//    preMul.values = preWt;
-//    trtWeights.push_back(preMul);
-//    nvinfer1::IConstantLayer* preM = network->addConstant(preDims, preMul);
-//    assert(preM != nullptr);
-//    std::string preLayerName = "preMul_" + std::to_string(layerIdx);
-//    preM->setName(preLayerName.c_str());
-//    // add post multiply matrix as a constant
-//    nvinfer1::Dims postDims{3,
-//                            {1, h, stride * w},
-//                            {nvinfer1::DimensionType::kCHANNEL, nvinfer1::DimensionType::kSPATIAL,
-//                             nvinfer1::DimensionType::kSPATIAL}};
-//    size = stride * h * w;
-//    nvinfer1::Weights postMul{nvinfer1::DataType::kFLOAT, nullptr, size};
-//    float* postWt = new float[size];
-//    /* (h * 2*w)
-//    [ [1, 1, 0, 0, ..., 0, 0],
-//      [0, 0, 1, 1, ..., 0, 0],
-//      ...,
-//      ...,
-//      [0, 0, 0, 0, ..., 1, 1] ]
-//    */
-//    for (int i = 0, idx = 0; i < h; ++i)
-//    {
-//        for (int j = 0; j < stride * w; ++j, ++idx)
-//        {
-//            postWt[idx] = (j / stride == i) ? 1.0 : 0.0;
-//        }
-//    }
-//    postMul.values = postWt;
-//    trtWeights.push_back(postMul);
-//    nvinfer1::IConstantLayer* post_m = network->addConstant(postDims, postMul);
-//    assert(post_m != nullptr);
-//    std::string postLayerName = "postMul_" + std::to_string(layerIdx);
-//    post_m->setName(postLayerName.c_str());
-//    // add matrix multiply layers for upsampling
-//
-//    std::cout<<dimsToString(preM->getOutput(0)->getDimensions())<<std::endl;
-//    std::cout<<dimsToString(input->getDimensions())<<std::endl;
-//
-//
-//    nvinfer1::IMatrixMultiplyLayer* mm1
-//        = network->addMatrixMultiply(*preM->getOutput(0), nvinfer1::MatrixOperation::kNONE, *input,
-//                                     nvinfer1::MatrixOperation::kNONE);
-//    //std::cout<<dimsToString(mm1->getOutput(0)->getDimensions())<<std::endl;
-//    std::cout<<dimsToString(post_m->getOutput(0)->getDimensions())<<std::endl;
-//
-//    assert(mm1 != nullptr);
-//    std::string mm1LayerName = "mm1_" + std::to_string(layerIdx);
-//    mm1->setName(mm1LayerName.c_str());   // mm1_85
-//
-//
-//
-//    nvinfer1::IMatrixMultiplyLayer* mm2
-//        = network->addMatrixMultiply(*mm1->getOutput(0), nvinfer1::MatrixOperation::kNONE,
-//                                     *post_m->getOutput(0), nvinfer1::MatrixOperation::kNONE);
-//    std::cout<<dimsToString(mm2->getOutput(0)->getDimensions())<<std::endl;
-//
-//    assert(mm2 != nullptr);
-//    std::string mm2LayerName = "mm2_" + std::to_string(layerIdx);
-//    mm2->setName(mm2LayerName.c_str());    // mm2_85
-//    return mm2;
-//}
 nvinfer1::ILayer* netAddUpsample(int layerIdx, std::map<std::string, std::string>& block,
                                  std::vector<float>& weights,
                                  std::vector<nvinfer1::Weights>& trtWeights, int& inputChannels,
@@ -606,16 +561,16 @@ nvinfer1::ILayer* netAddUpsample(int layerIdx, std::map<std::string, std::string
     assert(block.at("type") == "upsample");
     nvinfer1::Dims inpDims = input->getDimensions();
     assert(inpDims.nbDims == 3);
-    //assert(inpDims.d[1] == inpDims.d[2]);
+    assert(inpDims.d[1] == inpDims.d[2]);
     int h = inpDims.d[1];
     int w = inpDims.d[2];
     int stride = std::stoi(block.at("stride"));
     // add pre multiply matrix as a constant
     nvinfer1::Dims preDims{3,
-                           {1, stride * h, h},
+                           {1, stride * h, w},
                            {nvinfer1::DimensionType::kCHANNEL, nvinfer1::DimensionType::kSPATIAL,
                             nvinfer1::DimensionType::kSPATIAL}};
-    int size = stride * h * h;
+    int size = stride * h * w;
     nvinfer1::Weights preMul{nvinfer1::DataType::kFLOAT, nullptr, size};
     float* preWt = new float[size];
     /* (2*h * w)
@@ -632,7 +587,7 @@ nvinfer1::ILayer* netAddUpsample(int layerIdx, std::map<std::string, std::string
     {
         for (int s = 0; s < stride; ++s)
         {
-            for (int j = 0; j < h; ++j, ++idx)
+            for (int j = 0; j < w; ++j, ++idx)
             {
                 preWt[idx] = (i == j) ? 1.0 : 0.0;
             }
@@ -646,10 +601,10 @@ nvinfer1::ILayer* netAddUpsample(int layerIdx, std::map<std::string, std::string
     preM->setName(preLayerName.c_str());
     // add post multiply matrix as a constant
     nvinfer1::Dims postDims{3,
-                            {1, w, stride * w},
+                            {1, h, stride * w},
                             {nvinfer1::DimensionType::kCHANNEL, nvinfer1::DimensionType::kSPATIAL,
                              nvinfer1::DimensionType::kSPATIAL}};
-    size = stride * w * w;
+    size = stride * h * w;
     nvinfer1::Weights postMul{nvinfer1::DataType::kFLOAT, nullptr, size};
     float* postWt = new float[size];
     /* (h * 2*w)
@@ -659,7 +614,7 @@ nvinfer1::ILayer* netAddUpsample(int layerIdx, std::map<std::string, std::string
       ...,
       [0, 0, 0, 0, ..., 1, 1] ]
     */
-    for (int i = 0, idx = 0; i < w; ++i)
+    for (int i = 0, idx = 0; i < h; ++i)
     {
         for (int j = 0; j < stride * w; ++j, ++idx)
         {
@@ -673,22 +628,18 @@ nvinfer1::ILayer* netAddUpsample(int layerIdx, std::map<std::string, std::string
     std::string postLayerName = "postMul_" + std::to_string(layerIdx);
     post_m->setName(postLayerName.c_str());
     // add matrix multiply layers for upsampling
-
     nvinfer1::IMatrixMultiplyLayer* mm1
-            = network->addMatrixMultiply(*preM->getOutput(0), nvinfer1::MatrixOperation::kNONE, *input,
-                                         nvinfer1::MatrixOperation::kNONE);
-
+        = network->addMatrixMultiply(*preM->getOutput(0), nvinfer1::MatrixOperation::kNONE, *input,
+                                     nvinfer1::MatrixOperation::kNONE);
     assert(mm1 != nullptr);
     std::string mm1LayerName = "mm1_" + std::to_string(layerIdx);
-    mm1->setName(mm1LayerName.c_str());   // mm1_85
-
+    mm1->setName(mm1LayerName.c_str());
     nvinfer1::IMatrixMultiplyLayer* mm2
-            = network->addMatrixMultiply(*mm1->getOutput(0), nvinfer1::MatrixOperation::kNONE,
-                                         *post_m->getOutput(0), nvinfer1::MatrixOperation::kNONE);
-
+        = network->addMatrixMultiply(*mm1->getOutput(0), nvinfer1::MatrixOperation::kNONE,
+                                     *post_m->getOutput(0), nvinfer1::MatrixOperation::kNONE);
     assert(mm2 != nullptr);
     std::string mm2LayerName = "mm2_" + std::to_string(layerIdx);
-    mm2->setName(mm2LayerName.c_str());    // mm2_85
+    mm2->setName(mm2LayerName.c_str());
     return mm2;
 }
 
